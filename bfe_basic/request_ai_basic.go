@@ -119,6 +119,12 @@ type AiBasicInfo struct {
 	// response. An initial usage such as Anthropic message_start
 	// (output_tokens = 0) does not count.
 	finalUsageSeen bool
+
+	// usageDisposition tells the access log whether the token figures of
+	// this request may be reported (issue #1409). It is decided at request
+	// finish by mod_ai_token_auth; the zero value means "not judged"
+	// (non-token-auth traffic) and keeps the legacy behaviour.
+	usageDisposition string
 }
 
 // ClusterKeyName represents a tried cluster and API-Key pair during request processing
@@ -153,6 +159,37 @@ func (aiinfo *AiBasicInfo) MarkFinalUsageSeen() {
 
 func (aiinfo *AiBasicInfo) IsFinalUsageSeen() bool {
 	return aiinfo.finalUsageSeen
+}
+
+// Token-usage dispositions for the access log (issue #1409).
+const (
+	// UsageDispositionUnset is the zero value: no disposition was judged
+	// (the request did not go through token authentication, or the module
+	// was not loaded). The access-log fields keep their legacy behaviour.
+	UsageDispositionUnset = ""
+	// UsageDispositionNone means the request never successfully called the
+	// upstream (non-2xx response), so no model usage can exist: the access
+	// log must not report ai_input_tokens / ai_output_tokens /
+	// ai_total_tokens, and any auth-time or response-time estimate is
+	// residue, not usage.
+	UsageDispositionNone = "none"
+	// UsageDispositionObserved means the upstream was successfully called
+	// and the shared TokenUsage holds the real parsed usage or the
+	// EstimateToken estimate of this request (issue #1398 keeps that view
+	// observable); the access log reports it as-is.
+	UsageDispositionObserved = "observed"
+)
+
+// SetUsageDisposition records whether the token usage of this request may
+// be reported by the access log (issue #1409).
+func (aiinfo *AiBasicInfo) SetUsageDisposition(disposition string) {
+	aiinfo.usageDisposition = disposition
+}
+
+// UsageDisposition returns the token-usage disposition set at request
+// finish (UsageDispositionUnset when it was never judged).
+func (aiinfo *AiBasicInfo) UsageDisposition() string {
+	return aiinfo.usageDisposition
 }
 
 func GetApiKey(req *Request) string {

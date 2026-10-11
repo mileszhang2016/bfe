@@ -2588,3 +2588,127 @@ func TestUpdateCtxByUsage_Gemini(t *testing.T) {
 		t.Errorf("expected UsedQuota 20 (12+8 fallback), got %d", usage3.UsedQuota)
 	}
 }
+
+// Issue #1409: a non-2xx response means the upstream was never successfully
+// called, so the EstimateToken residue (prompt tokens seeded at auth time,
+// completion tokens accumulated from response bytes) must be dropped from the
+// shared TokenUsage and the request must be marked as "no usable usage" so the
+// access log reports no token field at all.
+func TestTokenRequestFinishHandler_Non2xxDropsEstimateResidue(t *testing.T) {
+	m := NewModuleAITokenAuth()
+	client := newMockRedisClient()
+	m.redisClient = client
+
+	clusterName := "deepseek-backup"
+	model := "deepseek-v4-flash"
+	req := newTestRequestWithCluster("ak-123", "AI_product", clusterName, model)
+
+	rmbPlan := &QuotaPlan{
+		Id:       "rmb-plan",
+		RedisKey: "QUOTA_AI_product-Non2xxDropsEstimate",
+		Unit:     "RMB",
+		Quota:    100000000,
+	}
+	SetTokenAuthContext(req, &Token{Key: "ak-123", KeyId: "ak-123-id",
+		QuotaPlans: []*QuotaPlan{rmbPlan}}, 100, nil)
+
+	ai := req.GetAiBasicInfo()
+	ai.SetAllowEstimateToken(true)
+	// Residue: the auth-time prompt seeding plus completion tokens guessed
+	// from the (404) response body, as described in issue #1409.
+	usage := ai.GetTokenUsage()
+	usage.CompletionTokens = 75
+
+	res := &bfe_http.Response{StatusCode: bfe_http.StatusNotFound}
+	if ret := m.tokenRequestFinishHandler(req, res); ret != bfe_module.BfeHandlerGoOn {
+		t.Fatalf("expected goon, got %d", ret)
+	}
+
+	if _, ok := client.data[rmbPlan.RedisKey]; ok {
+		t.Error("non-2xx response must not deduct quota")
+	}
+	if got := ai.UsageDisposition(); got != bfe_basic.UsageDispositionNone {
+		t.Errorf("UsageDisposition = %q, want %q", got, bfe_basic.UsageDispositionNone)
+	}
+	if u := ai.GetTokenUsage(); u.PromptTokens != 0 || u.CompletionTokens != 0 || u.UsedQuota != 0 {
+		t.Errorf("estimate residue must be dropped, got %+v", *u)
+	}
+}
+
+// Issue #1409: even a non-2xx response that happens to carry a real parsed
+// usage is never reported as usage of a failed request; the observation itself
+// is not destroyed (issue #1398 keeps observations on the shared object).
+func TestTokenRequestFinishHandler_Non2xxKeepsRealUsageObservation(t *testing.T) {
+	m := NewModuleAITokenAuth()
+	client := newMockRedisClient()
+	m.redisClient = client
+
+	req := newTestRequestWithCluster("ak-123", "AI_product", "deepseek-backup", "deepseek-v4-flash")
+	SetTokenAuthContext(req, &Token{Key: "ak-123", KeyId: "ak-123-id"}, 0, nil)
+
+	ai := req.GetAiBasicInfo()
+	usage := ai.GetTokenUsage()
+	usage.PromptTokens = 10
+	usage.CompletionTokens = 20
+	usage.UsedQuota = 30
+	ai.MarkFinalUsageSeen()
+
+	res := &bfe_http.Response{StatusCode: bfe_http.StatusInternalServerError}
+	if ret := m.tokenRequestFinishHandler(req, res); ret != bfe_module.BfeHandlerGoOn {
+		t.Fatalf("expected goon, got %d", ret)
+	}
+
+	if got := ai.UsageDisposition(); got != bfe_basic.UsageDispositionNone {
+		t.Errorf("UsageDisposition = %q, want %q", got, bfe_basic.UsageDispositionNone)
+	}
+	if u := ai.GetTokenUsage(); u.PromptTokens != 10 || u.CompletionTokens != 20 || u.UsedQuota != 30 {
+		t.Errorf("real usage observation must be kept, got %+v", *u)
+	}
+	if len(client.data) != 0 {
+		t.Error("non-2xx response must not deduct quota")
+	}
+}
+
+// Issue #1409: a successful (2xx) call keeps the observed disposition, and the
+// #1398/#1352 log view is untouched: a client abort without final usage keeps
+// the auth-seeded prompt estimate while nothing is deducted.
+func TestTokenRequestFinishHandler_ObservedDispositionKeepsLogView(t *testing.T) {
+	m := NewModuleAITokenAuth()
+	client := newMockRedisClient()
+	m.redisClient = client
+
+	clusterName := "deepseek-backup"
+	model := "deepseek-v4-flash"
+	req := newTestRequestWithCluster("ak-123", "AI_product", clusterName, model)
+	req.SvrDataConf = &mockServerDataConf{clusters: map[string]*bfe_cluster.BfeCluster{
+		clusterName: buildTestClusterConf(model, 0.000003, 0.000009),
+	}}
+
+	rmbPlan := &QuotaPlan{
+		Id:       "rmb-plan",
+		RedisKey: "QUOTA_AI_product-ObservedDisposition",
+		Unit:     "RMB",
+		Quota:    100000000,
+	}
+	SetTokenAuthContext(req, &Token{Key: "ak-123", KeyId: "ak-123-id",
+		QuotaPlans: []*QuotaPlan{rmbPlan}}, 100, nil)
+
+	ai := req.GetAiBasicInfo()
+	ai.SetAllowEstimateToken(true)
+	req.ErrCode = bfe_basic.ErrClientWrite // aborted before the final usage
+
+	res := &bfe_http.Response{StatusCode: bfe_http.StatusOK, ContentLength: -1}
+	if ret := m.tokenRequestFinishHandler(req, res); ret != bfe_module.BfeHandlerGoOn {
+		t.Fatalf("expected goon, got %d", ret)
+	}
+
+	if got := ai.UsageDisposition(); got != bfe_basic.UsageDispositionObserved {
+		t.Errorf("UsageDisposition = %q, want %q", got, bfe_basic.UsageDispositionObserved)
+	}
+	if _, ok := client.data[rmbPlan.RedisKey]; ok {
+		t.Error("client abort without final usage must not be deducted")
+	}
+	if u := ai.GetTokenUsage(); u.PromptTokens != 100 || u.UsedQuota != 0 {
+		t.Errorf("log view must keep the auth-seeded estimate (issue #1398), got %+v", *u)
+	}
+}

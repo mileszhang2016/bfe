@@ -53,6 +53,17 @@ type ModuleAITokenAuthState struct {
 	// (issue #1382 acceptance: never fall back to a wrong-mode price), so
 	// the counter is the monitoring signal for misconfigured price tables.
 	PriceLookupMiss *metrics.Counter
+	// Non2xxEstimateDropped counts requests whose upstream call never
+	// succeeded (non-2xx) and whose EstimateToken residue (auth-time prompt
+	// seeding / response-time completion guessing) was dropped from the
+	// shared TokenUsage so it could not be reported as model usage
+	// (issue #1409).
+	Non2xxEstimateDropped *metrics.Counter
+	// Non2xxRealUsageKept counts non-2xx requests that still carried a real
+	// parsed usage. Such observations are kept in the shared TokenUsage but
+	// never reported by the access log (issue #1409); a non-zero value means
+	// an upstream returned usage on an error response.
+	Non2xxRealUsageKept *metrics.Counter
 }
 
 type ModuleAITokenAuth struct {
@@ -267,13 +278,16 @@ func isClientAbortErr(err error) bool {
 }
 
 func (m *ModuleAITokenAuth) tokenRequestFinishHandler(req *bfe_basic.Request, res *bfe_http.Response) int {
-	// Skip token-count endpoints which should never be billed.
-	if strings.Contains(req.HttpRequest.RequestURI, "/count_tokens") {
+	if res == nil || res.StatusCode != bfe_http.StatusOK {
+		// only count used quota for successful requests; a non-2xx response
+		// means the upstream was never successfully called, so the request
+		// must not report model usage (issue #1409).
+		m.dropUnbilledEstimate(req, res)
 		return bfe_module.BfeHandlerGoOn
 	}
 
-	if res == nil || res.StatusCode != bfe_http.StatusOK {
-		// only count used quota for successful requests
+	// Skip token-count endpoints which should never be billed.
+	if strings.Contains(req.HttpRequest.RequestURI, "/count_tokens") {
 		return bfe_module.BfeHandlerGoOn
 	}
 
@@ -281,6 +295,12 @@ func (m *ModuleAITokenAuth) tokenRequestFinishHandler(req *bfe_basic.Request, re
 	if ctx == nil {
 		return bfe_module.BfeHandlerGoOn
 	}
+
+	// The upstream was successfully called: the shared TokenUsage holds the
+	// observed usage (real values, or the EstimateToken estimate approved by
+	// the billing yardstick). It may be reported by the access log
+	// (issue #1398 / #1409).
+	ctx.aiBasicInfo.SetUsageDisposition(bfe_basic.UsageDispositionObserved)
 
 	// Prevent duplicate deduction when HandleRequestFinish is triggered more than once.
 	if ctx.deducted {
@@ -372,6 +392,67 @@ func (m *ModuleAITokenAuth) tokenRequestFinishHandler(req *bfe_basic.Request, re
 
 	ctx.deducted = true
 	return bfe_module.BfeHandlerGoOn
+}
+
+// dropUnbilledEstimate handles the request-finish path of a response whose
+// upstream call never succeeded (res == nil or non-2xx, issue #1409).
+//
+// Such a request cannot have produced model usage, yet the shared TokenUsage
+// may still carry EstimateToken residue: the prompt tokens seeded at auth
+// time (mod_ai_token_auth.tokenFoundProductHandler, gated only by
+// Server.EstimateToken) and the completion tokens accumulated from response
+// bytes by mod_body_process.QuotaUsageProcessor. Because the access log
+// (mod_access_pb3) reads that shared object directly, the residue used to be
+// written as ai_input_tokens/ai_output_tokens while ai_total_tokens stayed 0,
+// polluting every token-based report.
+//
+// The residue is dropped here and the request is marked so the access log
+// reports no token field at all. Real usage parsed from the response is
+// never dropped: issue #1398 keeps observations visible on the shared
+// object, so it is only marked (and counted) as not-reportable.
+func (m *ModuleAITokenAuth) dropUnbilledEstimate(req *bfe_basic.Request, res *bfe_http.Response) {
+	aiBasicInfo := req.GetAiBasicInfo()
+	if aiBasicInfo == nil {
+		return
+	}
+
+	status := 0
+	if res != nil {
+		status = res.StatusCode
+	}
+
+	aiBasicInfo.SetUsageDisposition(bfe_basic.UsageDispositionNone)
+
+	if aiBasicInfo.IsFinalUsageSeen() {
+		// A real usage was parsed even though the final status is not 2xx
+		// (e.g. an upstream returning usage on an error response): keep the
+		// observation but never report it as usage of a failed request.
+		m.state.Non2xxRealUsageKept.Inc(1)
+		log.Logger.Warn("%s: non-2xx response carries real usage, not reported: status=%d cluster=%s key_id=%s",
+			m.name, status, req.Route.ClusterName, aiBasicInfo.ClientKeyId)
+		return
+	}
+
+	usage := aiBasicInfo.GetTokenUsage()
+	if usage.PromptTokens == 0 && usage.CompletionTokens <= 0 && usage.UsedQuota == 0 {
+		return // no residue to drop
+	}
+
+	usage.PromptTokens = 0
+	usage.CompletionTokens = 0
+	usage.CacheReadTokens = 0
+	usage.CacheWriteTokens = 0
+	usage.CacheWriteTokens1h = 0
+	usage.AudioInputTokens = 0
+	usage.AudioOutputTokens = 0
+	usage.ImageInputTokens = 0
+	usage.ImageCount = 0
+	usage.VideoCount = 0
+	usage.UsedQuota = 0
+
+	m.state.Non2xxEstimateDropped.Inc(1)
+	log.Logger.Warn("%s: drop estimated usage of non-2xx response: status=%d cluster=%s model=%s req_body_len=%d",
+		m.name, status, req.Route.ClusterName, aiBasicInfo.TargetModel, req.HttpRequest.ContentLength)
 }
 
 func SetApiKey(req *bfe_http.Request, apiKey string, authStyle string) {
